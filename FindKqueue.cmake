@@ -101,11 +101,28 @@ if (NOT HAVE_KQUEUE)
             set(cmake_cxx_compiler_launcher_arg)
         endif ()
 
+        # When cross-compiling for Emscripten (or any platform that converts
+        # SHARED→STATIC), both the 'kqueue' SHARED target and 'kqueue_static'
+        # STATIC target end up outputting libkqueue.a, causing Ninja to error
+        # with "multiple rules generate libkqueue.a".  Disable the shared
+        # library to avoid the conflict.
+        #
+        # Also provide a stub sys/prctl.h: the posix backend uses prctl() only
+        # to set thread names, which is a no-op in WASM.
+        if (CMAKE_SYSTEM_NAME STREQUAL Emscripten)
+            set(kqueue_shared_arg -DENABLE_SHARED=OFF)
+            # Locate the stubs directory relative to this cmake file.
+            get_filename_component(_wasm_cmake_dir "${CMAKE_CURRENT_LIST_FILE}" DIRECTORY)
+            set(kqueue_cflags_arg
+                "-DCMAKE_C_FLAGS=-isystem ${_wasm_cmake_dir}/wasm/emscripten-stubs")
+        endif ()
+
         execute_process(
             COMMAND
                 ${CMAKE_COMMAND} -G${CMAKE_GENERATOR} ${toolchain_arg}
                 ${cmake_c_compiler_launcher_arg} ${cmake_cxx_compiler_launcher_arg}
-                -DCMAKE_BUILD_TYPE:string=${CMAKE_BUILD_TYPE} ${WIN_CONFIG} ${kqueue_src}
+                -DCMAKE_BUILD_TYPE:string=${CMAKE_BUILD_TYPE} ${WIN_CONFIG}
+                ${kqueue_shared_arg} ${kqueue_cflags_arg} ${kqueue_src}
             WORKING_DIRECTORY ${kqueue_build}
             RESULT_VARIABLE kqueue_cmake_result
             ERROR_VARIABLE KQUEUE_CMAKE_OUTPUT
