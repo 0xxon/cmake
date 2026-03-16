@@ -35,10 +35,6 @@
 <div id="output"></div>
 
 <script>
-  // Capture Zeek's stdout and stderr so we can show them in the page.
-  var _stdout = [];
-  var _stderr = [];
-
   // Emscripten pthreads require SharedArrayBuffer, which in turn requires the
   // server to send COOP/COEP headers.  Show a clear error early if missing.
   if (typeof SharedArrayBuffer === 'undefined') {
@@ -49,54 +45,32 @@
     document.getElementById('status').className = 'error';
     throw new Error('SharedArrayBuffer unavailable');
   }
-
-  // Set up Module BEFORE zeek.js loads so Emscripten picks up our config.
-  window.Module = {
-    noInitialRun: true,
-
-    // Collect stdout lines (Zeek's normal output, notices, etc.)
-    print: function(text) {
-      _stdout.push(text);
-      console.log('[zeek]', text);
-    },
-
-    // Collect stderr lines (errors, warnings, script load failures, etc.)
-    printErr: function(text) {
-      _stderr.push(text);
-      console.warn('[zeek stderr]', text);
-    },
-
-    preRun: [function () {
-      // Create a working directory and chdir into it so Zeek writes logs there.
-      Module.FS.mkdir('/work');
-      Module.FS.chdir('/work');
-    }],
-
-    onRuntimeInitialized: function () {
-      document.getElementById('status').textContent = 'Zeek ready';
-      document.getElementById('status').className = 'ready';
-      document.getElementById('pcap-input').disabled = false;
-    },
-  };
 </script>
 
-<!-- Emscripten glue: must be loaded AFTER window.Module is defined.
+<!-- With MODULARIZE=1, zeek.js no longer sets up a global Module automatically.
+     Instead it exports a createZeekModule() factory function.  We load it here
+     and then call the factory once per pcap run.
      Requires zeek.wasm, zeek.data, and zeek.worker.js from the same directory.
      Serve with serve.py — plain http.server lacks the COOP/COEP headers
      that SharedArrayBuffer (required for pthreads) needs. -->
 <script src="zeek.js"></script>
 
 <script>
-  function renderOutput(outputEl) {
-    // Collect produced log files.
-    const logFiles = Module.FS.readdir('/work').filter(f => f.endsWith('.log'));
+  // createZeekModule is now a global factory function injected by zeek.js.
+  // Signal ready as soon as the script has loaded (no module init yet).
+  document.getElementById('status').textContent = 'Zeek ready';
+  document.getElementById('status').className = 'ready';
+  document.getElementById('pcap-input').disabled = false;
+
+  function renderOutput(outputEl, fs, stdout, stderr) {
+    const logFiles = fs.readdir('/work').filter(f => f.endsWith('.log'));
     logFiles.sort();
 
     if (logFiles.length === 0) {
       outputEl.innerHTML = '<p>Zeek finished but produced no .log files.</p>';
     } else {
       for (const logName of logFiles) {
-        const content = Module.FS.readFile('/work/' + logName, { encoding: 'utf8' });
+        const content = fs.readFile('/work/' + logName, { encoding: 'utf8' });
         const section = document.createElement('section');
         const h2 = document.createElement('h2');
         h2.textContent = logName;
@@ -108,26 +82,24 @@
       }
     }
 
-    // Always show Zeek's stderr (errors, warnings, script load failures).
-    if (_stderr.length > 0) {
+    if (stderr.length > 0) {
       const section = document.createElement('section');
       const h2 = document.createElement('h2');
       h2.textContent = 'stderr';
       const pre = document.createElement('pre');
       pre.className = 'stderr';
-      pre.textContent = _stderr.join('\n');
+      pre.textContent = stderr.join('\n');
       section.appendChild(h2);
       section.appendChild(pre);
       outputEl.appendChild(section);
     }
 
-    // Show stdout if non-empty (Zeek notices, debug output, etc.)
-    if (_stdout.length > 0) {
+    if (stdout.length > 0) {
       const section = document.createElement('section');
       const h2 = document.createElement('h2');
       h2.textContent = 'stdout';
       const pre = document.createElement('pre');
-      pre.textContent = _stdout.join('\n');
+      pre.textContent = stdout.join('\n');
       section.appendChild(h2);
       section.appendChild(pre);
       outputEl.appendChild(section);
@@ -136,9 +108,13 @@
     return logFiles.length;
   }
 
+  // Serialise runs: only one Zeek instance at a time.
+  let running = false;
+
   document.getElementById('pcap-input').addEventListener('change', async function (e) {
     const file = e.target.files[0];
-    if (!file) return;
+    if (!file || running) return;
+    running = true;
 
     const statusEl = document.getElementById('status');
     const spinner  = document.getElementById('spinner');
@@ -148,38 +124,55 @@
     statusEl.className   = '';
     spinner.style.display = 'inline';
     outputEl.innerHTML   = '';
-    _stdout = [];
-    _stderr = [];
+
+    const stdout = [];
+    const stderr = [];
 
     try {
-      // Read the pcap file into a JS ArrayBuffer.
       const buf = await file.arrayBuffer();
+      const pcapBytes = new Uint8Array(buf);
 
-      // Clean up any .log files from a previous run.
-      for (const f of Module.FS.readdir('/work')) {
-        if (f.endsWith('.log')) {
-          try { Module.FS.unlink('/work/' + f); } catch (_) {}
-        }
-      }
-
-      // Write the pcap into the virtual FS.
-      Module.FS.writeFile('/work/input.pcap', new Uint8Array(buf));
-
-      // With PROXY_TO_PTHREAD, callMain() returns immediately — main() runs in
-      // a Worker thread.  We wait for Zeek to call exit() via Module.onExit.
+      // Each call to createZeekModule() produces a fresh, independent runtime
+      // instance.  The .wasm binary and .data file are already cached by the
+      // browser, so re-instantiation is fast.
       const zeekDone = new Promise((resolve, reject) => {
-        Module.onExit = function (code) {
-          if (code === 0) resolve(code);
-          else reject(new Error('Zeek exited with code ' + code));
-        };
+        createZeekModule({
+          // Don't call main() automatically; we drive it via callMain below.
+          noInitialRun: true,
+
+          print: function(text) {
+            stdout.push(text);
+            console.log('[zeek]', text);
+          },
+
+          printErr: function(text) {
+            stderr.push(text);
+            console.warn('[zeek stderr]', text);
+          },
+
+          preRun: [function(m) {
+            m.FS.mkdir('/work');
+            m.FS.chdir('/work');
+            m.FS.writeFile('/work/input.pcap', pcapBytes);
+          }],
+
+          onExit: function(code) {
+            if (code === 0) resolve({ code, fs: this.FS });
+            else reject(Object.assign(new Error('Zeek exited with code ' + code), { fs: this.FS }));
+          },
+
+          // After the module is fully initialised, kick off main().
+          // With PROXY_TO_PTHREAD, callMain() returns immediately; main() runs
+          // in a Worker thread and onExit fires when it calls exit().
+          onRuntimeInitialized: function() {
+            this.callMain(['-r', '/work/input.pcap', '--no-checksums']);
+          },
+        }).catch(reject);
       });
 
-      Module.callMain(['-r', '/work/input.pcap', '--no-checksums']);
+      const { fs } = await zeekDone;
 
-      // Await Zeek's exit — the browser event loop stays live during this.
-      await zeekDone;
-
-      const nLogs = renderOutput(outputEl);
+      const nLogs = renderOutput(outputEl, fs, stdout, stderr);
       statusEl.textContent = 'Done — ' + nLogs + ' log file(s) from ' + file.name;
       statusEl.className   = 'ready';
 
@@ -187,9 +180,24 @@
       statusEl.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
       statusEl.className   = 'error';
       console.error(err);
-      renderOutput(outputEl);  // show whatever logs/stderr exist even on error
+      // Show whatever logs/stderr exist even on error, if we have an FS ref.
+      if (err && err.fs) renderOutput(outputEl, err.fs, stdout, stderr);
+      else if (stderr.length > 0) {
+        const section = document.createElement('section');
+        const h2 = document.createElement('h2');
+        h2.textContent = 'stderr';
+        const pre = document.createElement('pre');
+        pre.className = 'stderr';
+        pre.textContent = stderr.join('\n');
+        section.appendChild(h2);
+        section.appendChild(pre);
+        outputEl.appendChild(section);
+      }
     } finally {
       spinner.style.display = 'none';
+      running = false;
+      // Reset the file input so the same file can be re-selected.
+      e.target.value = '';
     }
   });
 </script>
