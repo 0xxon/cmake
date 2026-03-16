@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zeek WASM Test</title>
+<style>
+  body { font-family: monospace; max-width: 960px; margin: 2em auto; padding: 0 1em; }
+  h1 { font-size: 1.4em; }
+  #status { margin: 0.5em 0; color: #555; }
+  #status.ready { color: green; font-weight: bold; }
+  #status.error { color: red; }
+  #controls { margin: 1em 0; }
+  label { font-weight: bold; }
+  #output { margin-top: 1.5em; }
+  section { margin-bottom: 2em; }
+  h2 { font-size: 1em; margin-bottom: 0.3em; border-bottom: 1px solid #ccc; padding-bottom: 0.2em; }
+  pre { background: #f4f4f4; padding: 0.8em; overflow-x: auto; font-size: 0.85em;
+        white-space: pre; border: 1px solid #ddd; margin: 0; max-height: 400px; overflow-y: auto; }
+  pre.stderr { background: #fff8f0; border-color: #f0c060; }
+  #spinner { display: none; margin-left: 0.5em; }
+</style>
+</head>
+<body>
+
+<h1>Zeek WASM Test Page</h1>
+<div id="status">Loading Zeek WASM...</div>
+
+<div id="controls">
+  <label for="pcap-input">Select a .pcap file:</label>
+  <input type="file" id="pcap-input" accept=".pcap,.pcapng" disabled>
+  <span id="spinner">&#9696; Running...</span>
+</div>
+
+<div id="output"></div>
+
+<script>
+  // Capture Zeek's stdout and stderr so we can show them in the page.
+  var _stdout = [];
+  var _stderr = [];
+
+  // Emscripten pthreads require SharedArrayBuffer, which in turn requires the
+  // server to send COOP/COEP headers.  Show a clear error early if missing.
+  if (typeof SharedArrayBuffer === 'undefined') {
+    document.getElementById('status').textContent =
+      'Error: SharedArrayBuffer not available. ' +
+      'Serve this page with serve.py (not python3 -m http.server) to enable ' +
+      'the required Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy headers.';
+    document.getElementById('status').className = 'error';
+    throw new Error('SharedArrayBuffer unavailable');
+  }
+
+  // Set up Module BEFORE zeek.js loads so Emscripten picks up our config.
+  window.Module = {
+    noInitialRun: true,
+
+    // Collect stdout lines (Zeek's normal output, notices, etc.)
+    print: function(text) {
+      _stdout.push(text);
+      console.log('[zeek]', text);
+    },
+
+    // Collect stderr lines (errors, warnings, script load failures, etc.)
+    printErr: function(text) {
+      _stderr.push(text);
+      console.warn('[zeek stderr]', text);
+    },
+
+    preRun: [function () {
+      // Create a working directory and chdir into it so Zeek writes logs there.
+      Module.FS.mkdir('/work');
+      Module.FS.chdir('/work');
+    }],
+
+    onRuntimeInitialized: function () {
+      document.getElementById('status').textContent = 'Zeek ready';
+      document.getElementById('status').className = 'ready';
+      document.getElementById('pcap-input').disabled = false;
+    },
+  };
+</script>
+
+<!-- Emscripten glue: must be loaded AFTER window.Module is defined.
+     Requires zeek.wasm, zeek.data, and zeek.worker.js from the same directory.
+     Serve with serve.py — plain http.server lacks the COOP/COEP headers
+     that SharedArrayBuffer (required for pthreads) needs. -->
+<script src="zeek.js"></script>
+
+<script>
+  function renderOutput(outputEl) {
+    // Collect produced log files.
+    const logFiles = Module.FS.readdir('/work').filter(f => f.endsWith('.log'));
+    logFiles.sort();
+
+    if (logFiles.length === 0) {
+      outputEl.innerHTML = '<p>Zeek finished but produced no .log files.</p>';
+    } else {
+      for (const logName of logFiles) {
+        const content = Module.FS.readFile('/work/' + logName, { encoding: 'utf8' });
+        const section = document.createElement('section');
+        const h2 = document.createElement('h2');
+        h2.textContent = logName;
+        const pre = document.createElement('pre');
+        pre.textContent = content;
+        section.appendChild(h2);
+        section.appendChild(pre);
+        outputEl.appendChild(section);
+      }
+    }
+
+    // Always show Zeek's stderr (errors, warnings, script load failures).
+    if (_stderr.length > 0) {
+      const section = document.createElement('section');
+      const h2 = document.createElement('h2');
+      h2.textContent = 'stderr';
+      const pre = document.createElement('pre');
+      pre.className = 'stderr';
+      pre.textContent = _stderr.join('\n');
+      section.appendChild(h2);
+      section.appendChild(pre);
+      outputEl.appendChild(section);
+    }
+
+    // Show stdout if non-empty (Zeek notices, debug output, etc.)
+    if (_stdout.length > 0) {
+      const section = document.createElement('section');
+      const h2 = document.createElement('h2');
+      h2.textContent = 'stdout';
+      const pre = document.createElement('pre');
+      pre.textContent = _stdout.join('\n');
+      section.appendChild(h2);
+      section.appendChild(pre);
+      outputEl.appendChild(section);
+    }
+
+    return logFiles.length;
+  }
+
+  document.getElementById('pcap-input').addEventListener('change', async function (e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const statusEl = document.getElementById('status');
+    const spinner  = document.getElementById('spinner');
+    const outputEl = document.getElementById('output');
+
+    statusEl.textContent = 'Running Zeek on ' + file.name + '...';
+    statusEl.className   = '';
+    spinner.style.display = 'inline';
+    outputEl.innerHTML   = '';
+    _stdout = [];
+    _stderr = [];
+
+    try {
+      // Read the pcap file into a JS ArrayBuffer.
+      const buf = await file.arrayBuffer();
+
+      // Clean up any .log files from a previous run.
+      for (const f of Module.FS.readdir('/work')) {
+        if (f.endsWith('.log')) {
+          try { Module.FS.unlink('/work/' + f); } catch (_) {}
+        }
+      }
+
+      // Write the pcap into the virtual FS.
+      Module.FS.writeFile('/work/input.pcap', new Uint8Array(buf));
+
+      // With PROXY_TO_PTHREAD, callMain() returns immediately — main() runs in
+      // a Worker thread.  We wait for Zeek to call exit() via Module.onExit.
+      const zeekDone = new Promise((resolve, reject) => {
+        Module.onExit = function (code) {
+          if (code === 0) resolve(code);
+          else reject(new Error('Zeek exited with code ' + code));
+        };
+      });
+
+      Module.callMain(['-r', '/work/input.pcap', '--no-checksums']);
+
+      // Await Zeek's exit — the browser event loop stays live during this.
+      await zeekDone;
+
+      const nLogs = renderOutput(outputEl);
+      statusEl.textContent = 'Done — ' + nLogs + ' log file(s) from ' + file.name;
+      statusEl.className   = 'ready';
+
+    } catch (err) {
+      statusEl.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
+      statusEl.className   = 'error';
+      console.error(err);
+      renderOutput(outputEl);  // show whatever logs/stderr exist even on error
+    } finally {
+      spinner.style.display = 'none';
+    }
+  });
+</script>
+
+</body>
+</html>

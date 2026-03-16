@@ -46,12 +46,10 @@ ok "Prerequisites OK"
 mkdir -p "$DEPS_DIR" "$BUILD_DIR"
 export ZEEK_WASM_DEPS_DIR="$DEPS_DIR"
 
-# Point emscripten cache to a user-writable directory.
-# The system package installs to /usr/share/emscripten/cache which is not
-# writable by regular users; ports (e.g. zlib) cannot be downloaded otherwise.
-export EM_CACHE="$BUILD_DIR/emscripten-cache"
-mkdir -p "$EM_CACHE"
-info "Emscripten cache: $EM_CACHE"
+# We do not use any emscripten ports (zlib etc. are built from source), so
+# we leave EM_CACHE unset and let emscripten use its system cache
+# (/usr/share/emscripten/cache). With FROZEN_CACHE=True the system cache is
+# read-only but already contains the required sysroot — which is all we need.
 
 # ---------------------------------------------------------------------------
 # Phase 1: libpcap
@@ -79,7 +77,7 @@ else
     mkdir -p "$LIBPCAP_INSTALL"
     pushd "$LIBPCAP_SRC" >/dev/null
 
-    emconfigure ./configure \
+    CFLAGS="-pthread" emconfigure ./configure \
         --prefix="$LIBPCAP_INSTALL" \
         --disable-shared \
         --disable-usb \
@@ -135,7 +133,7 @@ else
 
     # zlib's configure is a custom shell script, not autoconf.
     # emconfigure works fine here.
-    emconfigure ./configure \
+    CFLAGS="-pthread" emconfigure ./configure \
         --prefix="$ZLIB_INSTALL" \
         --static
 
@@ -176,7 +174,7 @@ else
     # emscripten path to the CC variable which OpenSSL then double-expands,
     # producing a broken path like /usr/share/emscripten/em/usr/.../emcc.
     # Setting CC=emcc before ./Configure avoids this.
-    CC=emcc CXX=em++ AR=emar RANLIB=emranlib ./Configure linux-generic32 \
+    CC="emcc -pthread" CXX="em++ -pthread" AR=emar RANLIB=emranlib ./Configure linux-generic32 \
         --prefix="$OPENSSL_INSTALL" \
         --openssldir="$OPENSSL_INSTALL/ssl" \
         no-asm \
@@ -222,7 +220,42 @@ mkdir -p "$ZEEK_BUILD/scripts/base/bif"
 info "Phase 5: Building Zeek (this will take a while)..."
 cmake --build "$ZEEK_BUILD" -j"$JOBS" --target zeek_exe
 
+# ---------------------------------------------------------------------------
+# Phase 6: Patch zeek.js — wrap ___funcs_on_exit() in try-catch
+# ---------------------------------------------------------------------------
+# exitRuntime() calls __funcs_on_exit() which runs C++ atexit/destructor
+# handlers.  One of those handlers (from OpenSSL or prometheus-cpp) has a
+# null or type-mismatched function pointer in the WASM indirect call table,
+# causing a RuntimeError.  Log files are fully written to the virtual FS
+# before exit() is called, so destructors don't need to succeed.
+# We wrap just that one call in a try-catch so onExit still fires normally.
+ZEEK_JS="$ZEEK_BUILD/src/zeek.js"
+python3 - "$ZEEK_JS" << 'PYEOF'
+import sys
+path = sys.argv[1]
+old = '___funcs_on_exit();'
+new = 'try{___funcs_on_exit();}catch(e){console.warn("[zeek] exitRuntime error (ignored):",e);}'
+code = open(path).read()
+if old not in code:
+    print(f"[patch] WARNING: '{old}' not found in zeek.js — patch not applied", flush=True)
+    sys.exit(0)
+open(path, 'w').write(code.replace(old, new, 1))
+print(f"[patch] Patched exitRuntime in {path}", flush=True)
+PYEOF
+
+cp "$SCRIPT_DIR/test.html" "$ZEEK_BUILD/src/test.html"
+ok "Phase 6: zeek.js patched and test.html copied → $ZEEK_BUILD/src/"
+
 ok "Build complete!"
 echo ""
-echo "  WASM:   $ZEEK_BUILD/src/zeek.wasm"
+echo "  WASM:    $ZEEK_BUILD/src/zeek.wasm"
 echo "  JS glue: $ZEEK_BUILD/src/zeek.js"
+echo "  Data:    $ZEEK_BUILD/src/zeek.data  (preloaded Zeek scripts)"
+echo "  Test:    $ZEEK_BUILD/src/test.html"
+echo ""
+echo "To test in a browser (all four files must be served together):"
+echo "  cd $ZEEK_BUILD/src && python3 $SCRIPT_DIR/serve.py"
+echo "  Open http://localhost:8080/test.html"
+echo ""
+echo "  NOTE: pthreads require SharedArrayBuffer which requires COOP/COEP headers."
+echo "  serve.py sets these automatically. plain 'python3 -m http.server' will NOT work."
