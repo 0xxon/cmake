@@ -27,9 +27,19 @@
 <div id="status">Loading Zeek WASM...</div>
 
 <div id="controls">
-  <label for="pcap-input">Select a .pcap file:</label>
-  <input type="file" id="pcap-input" accept=".pcap,.pcapng" disabled>
-  <span id="spinner">&#9696; Running...</span>
+  <div>
+    <label for="pcap-input">pcap file (optional):</label>
+    <input type="file" id="pcap-input" accept=".pcap,.pcapng" disabled>
+  </div>
+  <div style="margin-top: 1em;">
+    <label for="zeek-script">Zeek script (optional):</label><br>
+    <textarea id="zeek-script" rows="8" style="width:100%;font-family:monospace;font-size:0.85em;margin-top:0.3em;"
+              placeholder="# e.g.&#10;event dns_request(c: connection, msg: dns_msg, name: string, qtype: count, qclass: count) {&#10;    print fmt(&quot;DNS query: %s&quot;, name);&#10;}"></textarea>
+  </div>
+  <div style="margin-top: 0.8em;">
+    <button id="run-btn" disabled>Run Zeek</button>
+    <span id="spinner" style="display:none; margin-left: 0.5em;">&#9696; Running...</span>
+  </div>
 </div>
 
 <div id="output"></div>
@@ -61,6 +71,7 @@
   document.getElementById('status').textContent = 'Zeek ready';
   document.getElementById('status').className = 'ready';
   document.getElementById('pcap-input').disabled = false;
+  document.getElementById('run-btn').disabled = false;
 
   function renderOutput(outputEl, fs, stdout, stderr) {
     const logFiles = fs.readdir('/work').filter(f => f.endsWith('.log'));
@@ -111,26 +122,30 @@
   // Serialise runs: only one Zeek instance at a time.
   let running = false;
 
-  document.getElementById('pcap-input').addEventListener('change', async function (e) {
-    const file = e.target.files[0];
-    if (!file || running) return;
+  document.getElementById('run-btn').addEventListener('click', async function () {
+    if (running) return;
     running = true;
 
-    const statusEl = document.getElementById('status');
-    const spinner  = document.getElementById('spinner');
-    const outputEl = document.getElementById('output');
+    const statusEl  = document.getElementById('status');
+    const spinner   = document.getElementById('spinner');
+    const outputEl  = document.getElementById('output');
+    const runBtn    = document.getElementById('run-btn');
+    const pcapInput = document.getElementById('pcap-input');
 
-    statusEl.textContent = 'Running Zeek on ' + file.name + '...';
+    const file       = pcapInput.files[0] || null;
+    const scriptText = document.getElementById('zeek-script').value.trim();
+
+    statusEl.textContent = file ? 'Running Zeek on ' + file.name + '...' : 'Running Zeek...';
     statusEl.className   = '';
     spinner.style.display = 'inline';
+    runBtn.disabled      = true;
     outputEl.innerHTML   = '';
 
     const stdout = [];
     const stderr = [];
 
     try {
-      const buf = await file.arrayBuffer();
-      const pcapBytes = new Uint8Array(buf);
+      const pcapBytes = file ? new Uint8Array(await file.arrayBuffer()) : null;
 
       // Each call to createZeekModule() produces a fresh, independent runtime
       // instance.  The .wasm binary and .data file are already cached by the
@@ -153,7 +168,8 @@
           preRun: [function(m) {
             m.FS.mkdir('/work');
             m.FS.chdir('/work');
-            m.FS.writeFile('/work/input.pcap', pcapBytes);
+            if (pcapBytes) m.FS.writeFile('/work/input.pcap', pcapBytes);
+            if (scriptText) m.FS.writeFile('/work/custom.zeek', scriptText);
           }],
 
           onExit: function(code) {
@@ -165,7 +181,10 @@
           // With PROXY_TO_PTHREAD, callMain() returns immediately; main() runs
           // in a Worker thread and onExit fires when it calls exit().
           onRuntimeInitialized: function() {
-            this.callMain(['-r', '/work/input.pcap', '--no-checksums']);
+            const args = [];
+            if (pcapBytes) args.push('-r', '/work/input.pcap', '--no-checksums');
+            if (scriptText) args.push('/work/custom.zeek');
+            this.callMain(args);
           },
         }).catch(reject);
       });
@@ -173,14 +192,13 @@
       const { fs } = await zeekDone;
 
       const nLogs = renderOutput(outputEl, fs, stdout, stderr);
-      statusEl.textContent = 'Done — ' + nLogs + ' log file(s) from ' + file.name;
+      statusEl.textContent = 'Done — ' + nLogs + ' log file(s)' + (file ? ' from ' + file.name : '');
       statusEl.className   = 'ready';
 
     } catch (err) {
       statusEl.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
       statusEl.className   = 'error';
       console.error(err);
-      // Show whatever logs/stderr exist even on error, if we have an FS ref.
       if (err && err.fs) renderOutput(outputEl, err.fs, stdout, stderr);
       else if (stderr.length > 0) {
         const section = document.createElement('section');
@@ -195,9 +213,8 @@
       }
     } finally {
       spinner.style.display = 'none';
+      runBtn.disabled = false;
       running = false;
-      // Reset the file input so the same file can be re-selected.
-      e.target.value = '';
     }
   });
 </script>
