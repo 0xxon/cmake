@@ -134,10 +134,11 @@ set(_wasm_link_flags
     "-sALLOW_MEMORY_GROWTH=1"
     "-sINITIAL_MEMORY=67108864"
     "-pthread"
+    "-fwasm-exceptions"
 )
-# -pthread must also be a compile flag so all translation units get the
-# right atomics/thread-local-storage ABI.
-add_compile_options(-pthread)
+# -pthread and -fwasm-exceptions must also be compile flags so all translation
+# units get the right atomics/thread-local-storage ABI and exception ABI.
+add_compile_options(-pthread -fwasm-exceptions)
 # FORCE_FILESYSTEM and EXPORTED_RUNTIME_METHODS / INVOKE_RUN are applied
 # only to the zeek_exe target (via target_link_options in src/CMakeLists.txt).
 # Build tools (bifcl, binpac, gen-zam) get -sNODERAWFS=1 instead so they

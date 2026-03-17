@@ -77,7 +77,7 @@ else
     mkdir -p "$LIBPCAP_INSTALL"
     pushd "$LIBPCAP_SRC" >/dev/null
 
-    CFLAGS="-pthread" emconfigure ./configure \
+    CFLAGS="-pthread -fwasm-exceptions" emconfigure ./configure \
         --prefix="$LIBPCAP_INSTALL" \
         --disable-shared \
         --disable-usb \
@@ -133,7 +133,7 @@ else
 
     # zlib's configure is a custom shell script, not autoconf.
     # emconfigure works fine here.
-    CFLAGS="-pthread" emconfigure ./configure \
+    CFLAGS="-pthread -fwasm-exceptions" emconfigure ./configure \
         --prefix="$ZLIB_INSTALL" \
         --static
 
@@ -174,7 +174,7 @@ else
     # emscripten path to the CC variable which OpenSSL then double-expands,
     # producing a broken path like /usr/share/emscripten/em/usr/.../emcc.
     # Setting CC=emcc before ./Configure avoids this.
-    CC="emcc -pthread" CXX="em++ -pthread" AR=emar RANLIB=emranlib ./Configure linux-generic32 \
+    CC="emcc -pthread -fwasm-exceptions" CXX="em++ -pthread -fwasm-exceptions" AR=emar RANLIB=emranlib ./Configure linux-generic32 \
         --prefix="$OPENSSL_INSTALL" \
         --openssldir="$OPENSSL_INSTALL/ssl" \
         no-asm \
