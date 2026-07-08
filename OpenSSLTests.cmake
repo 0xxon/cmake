@@ -8,11 +8,14 @@ if (MSVC)
     set(OPENSSL_OS_LIBRARIES ws2_32.lib Crypt32.lib)
 endif ()
 
+set(_openssl_tests_saved_required_includes ${CMAKE_REQUIRED_INCLUDES})
+set(_openssl_tests_saved_required_libraries ${CMAKE_REQUIRED_LIBRARIES})
+
 set(CMAKE_REQUIRED_LIBRARIES ${OPENSSL_LIBRARIES} ${CMAKE_DL_LIBS} ${OPENSSL_OS_LIBRARIES})
 # Use all includes, not just OpenSSL includes to see if there are
 # include files of different versions that do not match
 get_directory_property(includes INCLUDE_DIRECTORIES)
-set(CMAKE_REQUIRED_INCLUDES ${includes})
+set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR} ${includes})
 
 check_c_source_compiles(
     "
@@ -83,5 +86,7 @@ if (NOT CMAKE_CROSSCOMPILING AND NOT MSVC)
     endif ()
 endif ()
 
-set(CMAKE_REQUIRED_INCLUDES)
-set(CMAKE_REQUIRED_LIBRARIES)
+set(CMAKE_REQUIRED_INCLUDES ${_openssl_tests_saved_required_includes})
+set(CMAKE_REQUIRED_LIBRARIES ${_openssl_tests_saved_required_libraries})
+unset(_openssl_tests_saved_required_includes)
+unset(_openssl_tests_saved_required_libraries)
